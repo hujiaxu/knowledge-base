@@ -1,112 +1,253 @@
-import { useRef, useState } from 'react'
-import { Link } from 'react-router-dom'
-import { Button, Input, List, Space, Typography, message } from 'antd'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { MouseEvent } from 'react'
+import { useNavigate, useSearchParams } from 'react-router-dom'
+import { DeleteOutlined, PlusOutlined } from '@ant-design/icons'
+import { Button, Empty, Input, Space, Typography, message } from 'antd'
 import { aiApi } from '../api'
 import { ApiError } from '../api/client'
-import type { ChatSource } from '../types'
+import type { ChatMessage, ChatSession } from '../types'
+import { formatTime } from '../utils'
+import { DefaultChatTransport } from 'ai'
+import { getAccessToken } from '../auth'
+import { useChat } from '@ai-sdk/react'
+import { ChatMessageParts, historyToUIMessages, type KhUIMessage } from '../components/ChatMessageParts'
+import modal from 'antd/es/modal'
 
-interface Bubble {
-  role: 'user' | 'assistant'
-  content: string
-  sources?: ChatSource[]
-}
+
+const CHAT_ID = 'kh-chat'
 
 export default function ChatPage() {
-  const [input, setInput] = useState('')
-  const [topK, setTopK] = useState(5)
-  const [loading, setLoading] = useState(false)
-  const [messages, setMessages] = useState<Bubble[]>([])
-  const logRef = useRef<HTMLDivElement>(null)
+  const navigate = useNavigate()
+  const [params] = useSearchParams()
+  const sessionId = params.get('session') || undefined
 
-  async function send(asRagOnly = false) {
-    const text = input.trim()
-    if (!text) return
-    setInput('')
-    setMessages((prev) => [...prev, { role: 'user', content: text }])
-    setLoading(true)
+  const [sessions, setSessions] = useState<ChatSession[]>([])
+  const [input, setInput] = useState('')
+  const logRef = useRef<HTMLDivElement>(null)
+  const loadedSessionRef = useRef<string | undefined>(undefined)
+  const pinBottomRef = useRef(true)
+  const sessionIdRef = useRef(sessionId)
+
+
+  const transport = useMemo(
+    () => 
+        new DefaultChatTransport({
+          api: '/api/ai/chat/stream',
+          headers: () => {
+            const token = getAccessToken()
+            const headers: Record<string, string> = {}
+            if (token) headers['Authorization'] = `Bearer ${token}`
+            return headers
+          }
+        })
+    ,[]
+  )
+  const { messages, sendMessage, setMessages, status, stop, error } = useChat<KhUIMessage>({
+    id: CHAT_ID,
+    transport,
+    onData: (part) => {
+      if (part.type !== 'data-session') return
+      const nextId = part.data.sessionId
+      if (!nextId || nextId === sessionIdRef.current) return
+      loadedSessionRef.current = nextId
+      navigate(`/chat?session=${nextId}`, { replace: true })
+    },
+    onFinish: () => {
+      void loadSessions()
+    },
+    onError: (err) => {
+      message.error(err.message || '请求失败')
+    }
+  })
+  const streaming = status === 'submitted' || status === 'streaming'
+  const busy = streaming
+
+  async function loadSessions() {
     try {
-      if (asRagOnly) {
-        const hits = await aiApi.ragSearch(text, topK)
-        const content = hits.length
-          ? hits
-              .map(
-                (h, i) =>
-                  `[${i + 1}] ${h.documentTitle}${h.heading ? ` / ${h.heading}` : ''}\n${h.content.slice(0, 180)}`,
-              )
-              .join('\n\n')
-          : '没有召回到相关块。'
-        setMessages((prev) => [...prev, { role: 'assistant', content: `仅检索结果：\n\n${content}` }])
-      } else {
-        const res = await aiApi.chat(text, topK)
-        setMessages((prev) => [
-          ...prev,
-          { role: 'assistant', content: res.answer, sources: res.sources },
-        ])
-      }
-      requestAnimationFrame(() => {
-        logRef.current?.scrollTo({ top: logRef.current.scrollHeight })
-      })
-    } catch (error) {
-      message.error(error instanceof ApiError ? error.message : '请求失败')
-    } finally {
-      setLoading(false)
+      const res = await aiApi.sessions()
+      setSessions(res.items)
+    } catch {
+      /* 列表失败不挡问答 */
     }
   }
 
+  useEffect(() => {
+    loadSessions()
+  }, [])
+
+  useEffect(() => {
+    if (streaming) return
+    if (!sessionId) {
+      if (loadedSessionRef.current) {
+        loadedSessionRef.current = undefined
+        setMessages([])
+      }
+      return
+    }
+    let cancelled = false
+    aiApi
+      .messages(sessionId)
+      .then((rows: ChatMessage[]) => {
+        if (cancelled) return
+        setMessages(historyToUIMessages(rows))
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          message.error(error instanceof ApiError ? error.message : '加载会话失败')
+          navigate('/chat', { replace: true })
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [sessionId, streaming, navigate, setMessages])
+
+
+  function onLogScroll() {
+    const el = logRef.current
+    if (!el) return
+    pinBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80
+  }
+  
+  async function send() {
+    const text = input.trim()
+    if (!text || busy) return
+    setInput('')
+    pinBottomRef.current = true
+    await sendMessage({ text }, { body: { sessionId } })
+  }
+
+  function switchSession(id?: string) {
+    if (busy) {
+      message.warning('请等待当前回答结束再切换会话')
+      return
+    }
+    navigate(id ? `/chat?session=${id}` : '/chat')
+  }
+
+
+
+  async function onNew() {
+    if (busy) {
+      message.warning('请等待当前回答结束再开新对话')
+      return
+    }
+    try {
+      const created = await aiApi.createSession()
+      loadedSessionRef.current = created.id
+      setMessages([])
+      navigate(`/chat?session=${created.id}`)
+      void loadSessions()
+    } catch (err) {
+      message.error(err instanceof ApiError ? err.message : '创建失败')
+    }
+  }
+
+  function onRemove(id: string, e: MouseEvent) {
+    e.stopPropagation()
+    if (busy) {
+      message.warning('请等待当前回答结束再删除')
+      return
+    }
+    modal.confirm({
+      title: '确定删除对话？',
+      content: '删除后，聊天记录将不可恢复。',
+      okText: '删除',
+      cancelText: '取消',
+      okType: 'danger',
+      centered: true,
+      onOk: async () => {
+        try {
+          await aiApi.removeSession(id)
+          if (sessionId === id) {
+            loadedSessionRef.current = undefined
+            setMessages([])
+            navigate('/chat')
+          }
+          void loadSessions()
+        } catch (err) {
+          message.error(err instanceof ApiError ? err.message : '删除失败')
+          throw err
+        }
+      },
+    })
+  }
+
+  
   return (
-    <div className="kh-page kh-chat">
-      <Typography.Title level={4} style={{ marginTop: 0 }}>
-        知识问答
-      </Typography.Title>
-      <Typography.Paragraph type="secondary">
-        走混合检索后再生成。无召回不会调模型。当前为一次性返回，不是 SSE。
-      </Typography.Paragraph>
-      <div className="kh-chat-log" ref={logRef}>
-        {messages.map((m, i) => (
-          <div key={i} className={`kh-bubble ${m.role}`}>
-            {m.content}
-            {m.sources?.length ? (
-              <List
-                size="small"
-                style={{ marginTop: 8, background: '#fff', borderRadius: 8 }}
-                dataSource={m.sources}
-                renderItem={(s) => (
-                  <List.Item>
-                    <span>
-                      [{s.index}]{' '}
-                      <Link to={`/documents/${s.documentId}`}>{s.documentTitle}</Link>
-                      {s.heading ? ` / ${s.heading}` : ''}
-                      <div style={{ color: '#8c8c8c' }}>{s.excerpt}</div>
-                    </span>
-                  </List.Item>
-                )}
-              />
-            ) : null}
-          </div>
-        ))}
+    <div className="kh-page kh-chat-layout">
+      <aside className="kh-chat-sessions">
+        <Button type="primary" icon={<PlusOutlined />} block disabled={busy} onClick={() => void onNew()}>
+          新对话
+        </Button>
+        <div className="kh-chat-session-list">
+          {sessions.length === 0 ? (
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="还没有会话" />
+          ) : (
+            sessions.map((s) => (
+              <div
+                key={s.id}
+                className={`kh-chat-session-item${sessionId === s.id ? ' active' : ''}${busy ? ' disabled' : ''}`}
+                onClick={() => switchSession(s.id)}
+              >
+                <div className="kh-chat-session-title">{s.title}</div>
+                <div className="kh-chat-session-meta">
+                  <span>{formatTime(s.updatedAt)}</span>
+                  <DeleteOutlined onClick={(e) => onRemove(s.id, e)} />
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      </aside>
+      <div className="kh-chat-main">
+        <Typography.Title level={4} style={{ marginTop: 0 }}>
+          知识问答
+        </Typography.Title>
+        <Typography.Paragraph type="secondary">
+          流式回答会展示知识库检索、思考与联网搜索过程，并写入左侧会话。
+        </Typography.Paragraph>
+        <div className="kh-chat-log" ref={logRef} onScroll={onLogScroll}>
+          {messages.length === 0 ? (
+            <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description="输入问题开始一段对话" />
+          ) : (
+            messages.map((m, i) => {
+              const liveAssistant =
+                streaming && m.role === 'assistant' && i === messages.length - 1
+              return (
+                <div key={m.id} className={`kh-bubble ${m.role}`}>
+                  <ChatMessageParts
+                    messageId={m.id}
+                    parts={m.parts}
+                    role={m.role}
+                    showSources={!liveAssistant}
+                  />
+                </div>
+              )
+            })
+          )}
+          {error ? <div className="kh-chat-error">{error.message}</div> : null}
+        </div>
+        <Space.Compact style={{ width: '100%' }}>
+          <Input
+            size="large"
+            placeholder="例如：上线前如何做金丝雀验证？"
+            value={input}
+            disabled={busy}
+            onChange={(e) => setInput(e.target.value)}
+            onPressEnter={() => void send()}
+          />
+          {streaming ? (
+            <Button size="large" onClick={() => void stop()}>
+              停止
+            </Button>
+          ) : (
+            <Button type="primary" size="large" onClick={() => void send()}>
+              发送
+            </Button>
+          )}
+        </Space.Compact>
       </div>
-      <Space.Compact style={{ width: '100%' }}>
-        <Input
-          size="large"
-          placeholder="例如：上线前如何做金丝雀验证？"
-          value={input}
-          disabled={loading}
-          onChange={(e) => setInput(e.target.value)}
-          onPressEnter={() => void send(false)}
-        />
-        <Input
-          size="large"
-          style={{ width: 80 }}
-          value={topK}
-          onChange={(e) => setTopK(Number(e.target.value) || 5)}
-        />
-        <Button size="large" loading={loading} onClick={() => void send(true)}>
-          仅检索
-        </Button>
-        <Button type="primary" size="large" loading={loading} onClick={() => void send(false)}>
-          发送
-        </Button>
-      </Space.Compact>
     </div>
   )
 }

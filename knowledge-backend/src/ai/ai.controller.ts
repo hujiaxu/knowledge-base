@@ -1,16 +1,25 @@
-import { Body, Controller, Post } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query, Res } from '@nestjs/common';
 import { PermissionCode } from '../common/constants/permissions';
 import { RequirePermission } from '../auth/decorators.ts/require-permission.decorator';
 import { RagSearchDto } from './dto/rag-search.dto';
 import { HybridRetrievalService } from './hybrid-retrieval.service';
 import { AiChatService } from './ai-chat.service';
 import { ChatDto } from './dto/chat.dto';
+import { CurrentUser } from '../auth/decorators.ts/current-user.decorator';
+import type { AuthUser } from '../auth/auth-user.interface';
+import { CreateSessionDto, QuerySessionDto, UpdateSessionDto } from './dto/session.dto';
+import { ChatSessionService } from './chat-session.service';
+import { ChatStreamDto } from './dto/chat-stream.dto';
+import { AiStreamService } from './ai-stream.service';
+import type { Response } from 'express';
 
 @Controller()
 export class AiController {
   constructor(
     private readonly aiChat: AiChatService,
+    private readonly aiStream: AiStreamService,
     private readonly retrieval: HybridRetrievalService,
+    private readonly sessions: ChatSessionService,
   ) {}
 
 
@@ -29,5 +38,50 @@ export class AiController {
   @RequirePermission(PermissionCode.search)
   chat(@Body() dto: ChatDto) {
     return this.aiChat.chat(dto.content, dto.topK ?? 5);
+  }
+
+  /** LangChain Agent 流式作答，经 @ai-sdk/langchain 转成 UI Message Stream */
+  @Post('ai/chat/stream')
+  @RequirePermission(PermissionCode.search)
+  streamChat(
+    @Body() dto: ChatStreamDto,
+    @CurrentUser() user: AuthUser,
+    @Res() res: Response,
+  ) {
+    return this.aiStream.streamChat(dto, user, res);
+  }
+
+  @Get('ai/sessions')
+  @RequirePermission(PermissionCode.search)
+  listSessions(@Query() query: QuerySessionDto, @CurrentUser() user: AuthUser) {
+    return this.sessions.pageMine(user.userId, query);
+  }
+
+  @Post('ai/sessions')
+  @RequirePermission(PermissionCode.search)
+  createSession(@Body() dto: CreateSessionDto, @CurrentUser() user: AuthUser) {
+    return this.sessions.create(user.userId, dto);
+  }
+
+  @Get('ai/sessions/:id/messages')
+  @RequirePermission(PermissionCode.search)
+  listMessages(@Param('id') id: string, @CurrentUser() user: AuthUser) {
+    return this.sessions.listMessages(user.userId, id);
+  }
+
+  @Patch('ai/sessions/:id')
+  @RequirePermission(PermissionCode.search)
+  renameSession(
+    @Param('id') id: string,
+    @Body() dto: UpdateSessionDto,
+    @CurrentUser() user: AuthUser,
+  ) {
+    return this.sessions.rename(user.userId, id, dto);
+  }
+  
+  @Delete('ai/sessions/:id')
+  @RequirePermission(PermissionCode.search)
+  removeSession(@Param('id') id: string, @CurrentUser() user: AuthUser) {
+    return this.sessions.remove(user.userId, id);
   }
 }
