@@ -7,7 +7,7 @@ import {
 } from 'ai';
 import { toUIMessageStream } from '@ai-sdk/langchain';
 import { ChatOpenAI } from '@langchain/openai';
-import { HumanMessage } from '@langchain/core/messages';
+import { BaseMessage, HumanMessage } from '@langchain/core/messages';
 import {
   createAgent,
   modelCallLimitMiddleware,
@@ -22,6 +22,10 @@ import { ChatStreamDto } from "./dto/chat-stream.dto";
 import { ChatSource } from "./ai-chat.service";
 import { ChunkHit } from "../pipeline/types/pipeline.types";
 import { WebSearchService } from "./web-search.service";
+import { ChatShortMemoryService } from "./chat-short-memory.service";
+import { dbRowsToMessages } from "./chat-memory.util";
+import { ChatQueryRewriteService } from "./chat-query-rewrite.service";
+import { ChatLongMemoryService } from "./chat-long-memory.service";
 
 
 const EXCERPT_LEN = 200;
@@ -62,6 +66,9 @@ export class AiStreamService {
     private readonly retrieval: HybridRetrievalService,
     private readonly sessions: ChatSessionService,
     private readonly webSearch: WebSearchService,
+    private readonly shortMemory: ChatShortMemoryService,
+    private readonly longMemory: ChatLongMemoryService,
+    private readonly queryRewrite: ChatQueryRewriteService,
   ) {
     const apiKey =
       config.get<string>('OPENAI_API_KEY') ||
@@ -124,11 +131,31 @@ export class AiStreamService {
     });
   }
 
+  private async loadWorkingHistory(userId: string, sessionId: string) {
+    const cached = await this.shortMemory.tryLoad(userId, sessionId);
+    if (cached) return cached
+    const rows = await this.sessions.listRecentMessages(
+      userId,
+      sessionId,
+      this.shortMemory.windowSize
+    )
+    const history = dbRowsToMessages(rows)
+    if (history.length) {
+      await this.shortMemory.save(userId, sessionId, history)
+      this.logger.log(
+        `短期记忆从库回填：sessionId=${sessionId}, n=${history.length}`,
+      )
+    }
+
+    return history
+  }
+
   async streamChat(dto: ChatStreamDto, user: AuthUser, res: Response) {
     const question = lastUserText(dto.messages);
     const topK = dto.topK ?? 5;
     let persistSessionId = dto.sessionId;
     let persistSources: ChatSource[] = [];
+    let persistHistory: BaseMessage[] = [];
 
     const stream = createUIMessageStream<KhUIMessage>({
       execute: async ({ writer }) => {
@@ -156,21 +183,48 @@ export class AiStreamService {
           type: 'data-session',
           data: { sessionId: session.id }
         })
-        writer.write({
-          type: 'data-status',
-          data: { stage: 'retrieve', text: '正在检索知识库…' }
-        })
 
-        let hits: ChunkHit[] = []
-        try {
-          hits = await this.retrieval.retrieve(question, topK)
-        } catch (error) {
-          const detail = error instanceof Error ? error.message : String(error);
-          this.logger.warn(`RAG 检索失败：${detail}`);
+        const history = await this.loadWorkingHistory(user.userId, session.id);
+        persistHistory = history;
+
+        if (history.length) {
+          writer.write({
+            type: 'data-status',
+            data: { stage: 'rewrite', text: '正在理解问题...'}
+          })
         }
+        const plan = await this.queryRewrite.rewrite(question, history)
+        if (plan.needRetrieve) {
+          writer.write({
+            type: 'data-status',
+            data: { stage: 'retrieve', text: '正在检索知识库…' }
+          })
+        }
+
+        const [hits, memHits] = await Promise.all([
+          plan.needRetrieve ? this.retrieval.retrieve(plan.query, topK, user).catch(error => {
+            const detail = error instanceof Error ? error.message : String(error);
+            this.logger.warn(`RAG 检索失败：${detail}`);
+            return [] as ChunkHit[]
+          }) : Promise.resolve([] as ChunkHit[]),
+          this.longMemory.search(user.userId, session.id, plan.query)
+        ])
 
         const sources = this.toSources(hits)
         persistSources = sources
+        writer.write({
+          type: 'data-retrieve',
+          data: {
+            query: plan.query,
+            items: sources.map(src => ({
+              index: src.index,
+              documentId: src.documentId,
+              documentTitle: src.documentTitle,
+              heading: src.heading,
+            }))
+          }
+        })
+
         writer.write({
           type: 'data-retrieve',
           data: {
@@ -204,11 +258,17 @@ export class AiStreamService {
 
         const prompt = hits.length
           ? `检索到的资料：\n${this.buildContext(hits)}\n\n用户问题：${question}`
-          : `知识库没有召回到相关内容。\n\n用户问题：${question}`;
+          : plan.needRetrieve
+            ? `知识库没有召回到相关内容。\n\n用户问题：${question}`
+            : `用户问题：${question}`;
 
-        
+        const memoryMsg = this.longMemory.buildSystemMessage(memHits);
         const langchainStream = await this.agent.stream(
-          { messages: [new HumanMessage(prompt)] },
+          { messages: [
+            ...(memoryMsg ? [memoryMsg] : []),
+            ...history,
+            new HumanMessage(prompt)
+          ] },
           // messages：模型 token/思考；tools：web_search 调用，给适配包转成 tool-* 事件
           { streamMode: ['messages', 'tools'] },
         );
@@ -238,6 +298,7 @@ export class AiStreamService {
           ? persistSources.filter((s) => used.has(s.index))
           : [];
         if (!question || !persistSessionId) return;
+        const finalAnswer = answer || '未能生成回答。';
         try {
           await this.sessions.appendTurn(
             user.userId,
@@ -246,11 +307,24 @@ export class AiStreamService {
             answer || '未能生成回答。',
             sources,
           );
+          await this.shortMemory.appendTurn(
+            user.userId,
+            persistSessionId,
+            persistHistory,
+            question,
+            finalAnswer
+          )
         } catch (error) {
           this.logger.warn(
             `流式对话落库失败：${error instanceof Error ? error.message : error}`,
           );
         }
+        this.longMemory.rememberTurn(
+          user.userId,
+          persistSessionId,
+          question,
+          finalAnswer
+        )
       },
       onError: (error) =>
         error instanceof Error ? error.message : String(error),

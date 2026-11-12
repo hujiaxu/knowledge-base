@@ -1,7 +1,10 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from "@nestjs/common";
 import { Client } from '@elastic/elasticsearch';
+import type { estypes } from '@elastic/elasticsearch'
 import { ConfigService } from "@nestjs/config";
 import { ChunkHit, DocumentChunk } from "./types/pipeline.types";
+import { DocumentAccessScope, ES_CHUNK_VISIBILITY_FIELDS, esVisibilityFilter, wrapEsQuery } from "../document/document-access";
+import { DocumentContentDocument } from "../document/schemas/document-content.schema";
 
 /** RAG 分块向量索引名 */
 const CHUNK_INDEX = 'kh_chunk';
@@ -200,15 +203,16 @@ export class VectorIndexService implements OnModuleInit, OnModuleDestroy {
     query: string;
     queryVector?: number[] | null;
     hybridTopK?: number;
-    rrfC?: number
+    rrfC?: number;
+    scope?: DocumentAccessScope
   }) {
     const hybridTopK = this.clampTopK(params.hybridTopK ?? 20);
     const rrfC = params.rrfC && params.rrfC > 0 ? params.rrfC : 60;
 
     const [keywordHits, vectorHits] = await Promise.all([
-      this.keywordSearch(params.query, hybridTopK),
+      this.keywordSearch(params.query, hybridTopK, params.scope),
       params.queryVector?.length
-        ? this.knnSearch(params.queryVector, hybridTopK)
+        ? this.knnSearch(params.queryVector, hybridTopK, params.scope)
         : Promise.resolve([] as ChunkHit[]),
     ]);
 
@@ -243,7 +247,7 @@ export class VectorIndexService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  async keywordSearch(query: string, topK = 20): Promise<ChunkHit[]> {
+  async keywordSearch(query: string, topK = 20, scope?: DocumentAccessScope): Promise<ChunkHit[]> {
     if (!this.es) {
       this.logger.warn('跳过关键词检索（ES 不可用）');
       return [];
@@ -254,17 +258,22 @@ export class VectorIndexService implements OnModuleInit, OnModuleDestroy {
 
     const k = this.clampTopK(topK);
 
+    const vis = scope ? esVisibilityFilter(scope, ES_CHUNK_VISIBILITY_FIELDS) : null
+
     try {
       const response = await this.es.search({
         index: CHUNK_INDEX,
         size: k,
-        query: {
-          multi_match: {
-            query: trimmed,
-            fields: ['document_title^2', 'content'],
-            analyzer: 'ik_smart',
+        query: wrapEsQuery(
+          {
+            multi_match: {
+              query: trimmed,
+              fields: ['document_title^2', 'content'],
+              analyzer: 'ik_smart',
+            },
           },
-        },
+          vis
+        ) as estypes.QueryDslQueryContainer,
         _source: [
           'chunk_id',
           'document_id',
@@ -281,7 +290,7 @@ export class VectorIndexService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  async knnSearch(queryVector: number[], topK = 20): Promise<ChunkHit[]> {
+  async knnSearch(queryVector: number[], topK = 20, scope?: DocumentAccessScope): Promise<ChunkHit[]> {
     if (!this.es) {
       this.logger.warn('跳过向量检索（ES 不可用）');
       return [];
@@ -290,7 +299,16 @@ export class VectorIndexService implements OnModuleInit, OnModuleDestroy {
 
     const k = this.clampTopK(topK)
 
+    const vis = scope ? esVisibilityFilter(scope, ES_CHUNK_VISIBILITY_FIELDS) : null
+
     try {
+      const knn: estypes.KnnSearch = {
+        field: 'embedding',
+         query_vector: queryVector,
+         k,
+         num_candidates: Math.max(k * 10, 50)
+      }
+      if (vis) knn.filter = vis as estypes.QueryDslQueryContainer
       const response = await this.es.search({
         index: CHUNK_INDEX,
         size: k,
